@@ -2,15 +2,43 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import pathlib
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterator
 from typing import Any
 
 from .collect import ToolCall
 from .collect import ToolResult
+
+
+class BadConcurrency(ValueError):
+    def __init__(self, max_concurrency: int):
+        self.max_concurrency = max_concurrency
+        super().__init__(
+            f"max_concurrency must be at least 1, not {max_concurrency}"
+        )
+
+
+class WrongTrial(ValueError):
+    """``run(trial)`` returned a record for some other trial index."""
+
+    def __init__(self, asked: int, got: int):
+        self.asked = asked
+        self.got = got
+        super().__init__(f"asked for trial {asked}, got a record for {got}")
+
+
+class TrialsFailed(ExceptionGroup):
+    """Some trials of a :func:`top_up_async` call raised."""
+
+    def __new__(cls, failures: list[Exception], attempted: int):
+        return super().__new__(
+            cls, f"{len(failures)} of {attempted} trials failed", failures
+        )
 
 
 @dataclasses.dataclass(slots=True)
@@ -154,3 +182,62 @@ def top_up(
         if on_trial is not None:
             on_trial(record)
     return trials - done
+
+
+def completed_trials(path: pathlib.Path) -> set[int]:
+    """The trial indices in ``path``, or an empty set when it is absent."""
+    if not path.exists():
+        return set()
+    return {record.trial for record in iter_read(path)}
+
+
+async def top_up_async(
+    path: pathlib.Path,
+    trials: int,
+    run: Callable[[int], Awaitable[TrialRecord]],
+    *,
+    max_concurrency: int = 1,
+    on_trial: Callable[[TrialRecord], None] | None = None,
+) -> int:
+    """Top ``path`` up to trials ``0 .. trials - 1``, concurrently.
+
+    The concurrent counterpart of :func:`top_up`, for trials that are safe
+    to run side by side, such as ``agui.run_trial`` against a server
+    process. ``drive.run_trial`` is not one of them. At most
+    ``max_concurrency`` calls of ``run`` are in flight at once.
+
+    Resumes by **trial index**, not by line count: concurrent trials finish
+    out of order, so an interrupted run can leave trial 2 on disk without
+    trial 1, and only the missing indices run again.
+
+    Each record is appended as it completes, from the event loop's thread,
+    so appends never interleave. ``on_trial`` runs after the append.
+
+    A trial that raises does not stop the others: every in-flight trial
+    finishes and is recorded, and then the failures are raised together as
+    a :class:`TrialsFailed` group. A record whose ``trial`` differs from the
+    index it was run for is refused with :class:`WrongTrial`, not written.
+    """
+    if max_concurrency < 1:
+        raise BadConcurrency(max_concurrency)
+    missing = [t for t in range(trials) if t not in completed_trials(path)]
+    if not missing:
+        return 0
+    gate = asyncio.Semaphore(max_concurrency)
+
+    async def one(trial: int) -> None:
+        async with gate:
+            record = await run(trial)
+        if record.trial != trial:
+            raise WrongTrial(trial, record.trial)
+        append(path, record)
+        if on_trial is not None:
+            on_trial(record)
+
+    outcomes = await asyncio.gather(
+        *(one(trial) for trial in missing), return_exceptions=True
+    )
+    failures = [o for o in outcomes if isinstance(o, Exception)]
+    if failures:
+        raise TrialsFailed(failures, len(missing))
+    return len(missing)

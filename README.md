@@ -31,6 +31,7 @@ where the current tag is; there is no `CHANGELOG.md` to keep in sync.
 | `collect` | captures the tool calls a run made, and what came back |
 | `records` | one record per trial, appended to JSONL; tops a file up to N |
 | `drive` | runs one turn against an installation, in process |
+| `agui` | drives a running server over AG-UI HTTP, with client tools |
 | `scoring` | turns records into rates, with pluggable checks |
 | `environs` | builds one virtualenv per code-axis value |
 | `preconditions` | refuses a run whose cells cannot answer the question |
@@ -155,6 +156,111 @@ most one trial.
 `metadata` is open on purpose: stamp whatever identifies the arm -- resolved
 commit sha, exact model id, endpoint. A result whose arm cannot be identified
 afterwards is not a result.
+
+## Driving a room over AG-UI
+
+`drive` runs `soliplex ask` in process, and that path sends no client
+tools, context, state or forwarded props. `agui` is the client side of the
+protocol. It talks to a running `soliplex-cli serve`, runs the model's calls
+to client tools itself, and sends the results in the next run of the same
+thread.
+
+```python
+import asyncio
+import json
+from pathlib import Path
+
+from soliplex_lab_harness import agui
+from soliplex_lab_harness import records
+
+agui.configure_telemetry("my-jig")  # optional, once per process
+
+
+def run_code(args):
+    return json.dumps({"value": len(args["code"])})
+
+
+profile = agui.ClientProfile(
+    tools=(
+        agui.ClientTool(
+            name="run_code",
+            description="Run a program on the user's device.",
+            parameters={
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+            },
+            handler=run_code,
+            metadata={"skill": "ledger"},
+        ),
+    ),
+    context=({"description": "units", "value": "metric"},),
+    state={"client_prefs": {"units": "metric"}},
+    forwarded_props={"trigger": "button"},
+    max_rounds=6,
+)
+
+with agui.serve(
+    Path("cells/tip/installation.yaml"),
+    log=Path("work/tip/server.log"),
+    environment=env,  # an environs.Environment, or command=[...]
+) as served:
+    server = agui.Server(served.url)
+
+    async def trial(index):
+        return await asyncio.to_thread(
+            agui.run_trial,
+            server,
+            "ledger",
+            ["What is my pending total?", "And last month?"],
+            cell="tip",
+            trial=index,
+            profile=profile,
+            metadata=env.metadata(),
+        )
+
+    asyncio.run(
+        records.top_up_async(
+            Path("results/tip.jsonl"), 20, trial, max_concurrency=4
+        )
+    )
+```
+
+- `Session(server, room, profile).turn(text)` is the lower level: one user
+  message, then client-tool rounds until the model stops calling client
+  tools or `max_rounds` is reached (`error == agui.MAX_ROUNDS`). A second
+  `turn` continues the thread with its history and state. Its
+  `TurnResult` keeps every run's request body and raw SSE lines.
+- The session sends its `state` with every run and, with
+  `adopt_snapshots=True`, replaces it with each `STATE_SNAPSHOT`.
+- `Fence(tag, handler)` is a protocol without client tools. Each
+  `` ```tag `` block in a run's reply goes to `handler`, and the results go
+  back as the next user message (`"<tag> result:\n..."` by default). Fence
+  rounds count toward `max_rounds`, and the blocks land in
+  `metadata["fence_blocks"]`, not in `tool_calls`.
+- `run_trial` stamps `thread_id`, `run_ids`, `rounds`, `trace_id` and the
+  final `state` into `metadata`. Nothing process-global changes, so trials
+  may run concurrently. `records.top_up_async` runs them under a
+  concurrency bound and resumes by trial index.
+- `configure_telemetry` instruments httpx, so every request carries a W3C
+  `traceparent`. It sends only when `LOGFIRE_TOKEN` is set.
+
+### What an AG-UI record can see
+
+The records come from the event stream, because
+`pydantic_ai.all_messages` stays in the server process. pydantic-ai's AG-UI
+adapter streams each tool-call part under the name the model used, before
+`_resolve_tool` runs, and streams each `RetryPromptPart` that answers a
+tool call as a `TOOL_CALL_RESULT` carrying `model_response()`. Invented
+tool names and tool retries therefore reach `tool_calls` and
+`tool_results` with the text that `collect` reads, and
+`scoring.invented_tool_name`, `scoring.retried` and
+`scoring.classify_result` work unchanged. This is the behaviour of
+pydantic-ai 2.56. A code axis that moves pydantic-ai needs it checked again.
+
+A `ModelRetry` that answers no tool call, such as one from an output
+validator, appears in neither source. The event stream does not carry it,
+and `collect` reads it as a plain text part.
 
 ## Preconditions: refuse before spending trials
 
