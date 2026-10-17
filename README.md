@@ -100,7 +100,8 @@ table.
 `soliplex` is the software under test. An experiment pins it per code-axis
 value -- `soliplex==0.78.1`, or `soliplex @ git+<url>@<sha>` -- so a pin here
 would fight the axis. Both `soliplex` and `logfire` are imported lazily by
-`drive`, which raises a pointed error if they are missing.
+`drive`, which raises a pointed error if they are missing. `agui` imports
+`httpx` and `logfire` the same way. Both arrive with soliplex.
 
 ## Sketch
 
@@ -242,8 +243,25 @@ with agui.serve(
   final `state` into `metadata`. Nothing process-global changes, so trials
   may run concurrently. `records.top_up_async` runs them under a
   concurrency bound and resumes by trial index.
-- `configure_telemetry` instruments httpx, so every request carries a W3C
-  `traceparent`. It sends only when `LOGFIRE_TOKEN` is set.
+- `serve` runs `soliplex-cli audit -q` for `installation`, `rooms` and
+  `skills` first, with the server's launcher and environment, and raises
+  `preconditions.Failed` before starting a server whose configuration
+  fails. `agui.audit` returns the same `preconditions.Result` list.
+  `audit all` is left out because its Ollama section raises on an
+  installation without a `haiku.rag.yaml`.
+- A run that ends waiting on calls that are not client tools, such as a
+  server tool needing approval, ends the turn with
+  `error` starting `agui.UNANSWERED`.
+- `Server` writes the current trace context into every POST with
+  `opentelemetry.propagate.inject`, and opens no span for the HTTP call.
+  The spans are the trial, one per round, an `execute_tool <name>` span per
+  client tool call with pydantic-ai's `gen_ai.*` attributes, and the
+  server's own. `serve(link_traces=...)` makes the server read that
+  context: soliplex instruments FastAPI inside its lifespan, too late to
+  take an incoming `traceparent`, so `serve` launches the app through
+  `asgi_trace`, which only attaches the extracted context per request.
+  `link_traces` defaults to whether `configure_telemetry` has run.
+- `configure_telemetry` sends only when `LOGFIRE_TOKEN` is set.
 
 ### What an AG-UI record can see
 
@@ -258,9 +276,17 @@ tool names and tool retries therefore reach `tool_calls` and
 `scoring.classify_result` work unchanged. This is the behaviour of
 pydantic-ai 2.56. A code axis that moves pydantic-ai needs it checked again.
 
+`tool_results` is `None` when any recorded call has no captured result:
+a turn stopped at the round cap with calls pending, or a `RUN_ERROR`
+between a call and its result. Calls the client runs itself report their
+failures as `{"error": ...}`, which `scoring.classify_result` reads as
+`tool-error`, not as a retry: pydantic-ai has already validated their
+arguments on the server, and any rejection there arrives as a retry.
+
 A `ModelRetry` that answers no tool call, such as one from an output
-validator, appears in neither source. The event stream does not carry it,
-and `collect` reads it as a plain text part.
+validator, is counted by neither source. pydantic-ai serializes a
+`RetryPromptPart` without a tool name as a text part, which `collect`
+skips, and the event stream carries only the rejected assistant text.
 
 ## Preconditions: refuse before spending trials
 

@@ -173,3 +173,53 @@ def test_completed_trials(tmp_path):
     records.append(path, make_record(0))
 
     assert records.completed_trials(path) == {0, 2}
+
+
+def test_trials_failed_supports_except_star(tmp_path):
+    path = tmp_path / "c.jsonl"
+
+    async def run(trial):
+        raise EndpointDown
+
+    caught = []
+    try:
+        run_async(records.top_up_async(path, 2, run, max_concurrency=2))
+    except* EndpointDown as group:
+        caught.append(group)
+
+    (group,) = caught
+    assert isinstance(group, records.TrialsFailed)
+    assert len(group.exceptions) == 2
+    assert group.attempted == 2
+
+
+def test_cancellation_is_not_swallowed(tmp_path):
+    path = tmp_path / "c.jsonl"
+
+    async def run(trial):
+        if trial == 0:
+            raise asyncio.CancelledError
+        return make_record(trial)
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(records.top_up_async(path, 2, run, max_concurrency=2))
+
+
+def test_the_file_is_read_once(tmp_path, monkeypatch):
+    path = tmp_path / "c.jsonl"
+    records.append(path, make_record(0))
+    reads = []
+    original = records.iter_read
+
+    def counting(p):
+        reads.append(p)
+        return original(p)
+
+    monkeypatch.setattr(records, "iter_read", counting)
+
+    async def run(trial):
+        return make_record(trial)
+
+    run_async(records.top_up_async(path, 5, run, max_concurrency=5))
+
+    assert len(reads) == 1

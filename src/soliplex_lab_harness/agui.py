@@ -17,8 +17,9 @@ streams every ``RetryPromptPart`` that answers a tool call as a
 ``TOOL_CALL_RESULT`` whose content is ``model_response()``. So invented tool
 names and tool retries reach ``TrialRecord.tool_calls`` and ``tool_results``
 with the same text ``collect`` reads. A retry that answers no tool call (an
-output validator's ``ModelRetry``) appears in neither: ``collect`` reads it
-as a plain text part, and the event stream does not carry it at all.
+output validator's ``ModelRetry``) is counted by neither. pydantic-ai
+serializes a ``RetryPromptPart`` without a tool name as a text part, which
+``collect`` skips, and the event stream carries only the rejected text.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from typing import Any
 
+from . import preconditions
 from . import records
 from .collect import ToolCall
 from .collect import ToolResult
@@ -50,6 +52,14 @@ _MISSING = (
 
 #: The turn error when the model still calls client tools after the cap.
 MAX_ROUNDS = "max client rounds reached"
+
+#: The turn error when a run ends waiting on calls that are not client
+#: tools, such as a server tool that needs approval.
+UNANSWERED = "unanswered tool calls"
+
+#: The turn error when one run starts two tool calls with the same id, so
+#: results cannot be matched to calls.
+DUPLICATE_CALL_ID = "duplicate tool call id"
 
 #: ``metadata["outcomes"]`` on a record from :func:`run_trial`.
 OUTCOMES_SOURCE = "ag-ui events"
@@ -80,6 +90,14 @@ def _span(name: str, **attributes: Any) -> Iterator[Any]:
         yield span
 
 
+def _as_json(text: str) -> Any:
+    """``text`` decoded as JSON, or ``text`` itself when it is not JSON."""
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return text
+
+
 def _error_json(exc: Exception) -> str:
     return json.dumps(
         {"error": {"type": type(exc).__name__, "message": str(exc)}}
@@ -95,6 +113,11 @@ class Server:
     ``transport`` is handed to ``httpx.Client``, and tests pass an
     ``httpx.MockTransport``. One client is shared by every session on this
     server, and ``httpx.Client`` is safe to share between threads.
+
+    Every POST carries the current trace context in its headers, written
+    by ``inject`` (``opentelemetry.propagate.inject`` when importable), so
+    the server's spans join the caller's trace. No span is opened for the
+    HTTP call itself.
     """
 
     def __init__(
@@ -103,12 +126,26 @@ class Server:
         *,
         timeout: float = 600.0,
         transport: Any = None,
+        inject: Callable[[dict[str, str]], None] | None = None,
     ):
         httpx = _httpx()
         self.base_url = base_url
+        self.inject = inject
         self.http = httpx.Client(
             base_url=base_url, timeout=timeout, transport=transport
         )
+
+    def _trace_headers(self) -> dict[str, str]:
+        inject = self.inject
+        if inject is None:
+            try:
+                from opentelemetry import propagate
+            except ImportError:
+                return {}
+            inject = propagate.inject
+        carrier: dict[str, str] = {}
+        inject(carrier)
+        return carrier
 
     def close(self) -> None:
         self.http.close()
@@ -119,6 +156,7 @@ class Server:
         return self.http.post(
             f"/api/v1/rooms/{room}/agui",
             json={"metadata": dict(metadata or {})},
+            headers=self._trace_headers(),
         )
 
     def new_run(
@@ -127,7 +165,11 @@ class Server:
         body = (
             {} if parent_run_id is None else {"parent_run_id": parent_run_id}
         )
-        return self.http.post(f"/api/v1/rooms/{room}/agui/{thread}", json=body)
+        return self.http.post(
+            f"/api/v1/rooms/{room}/agui/{thread}",
+            json=body,
+            headers=self._trace_headers(),
+        )
 
     def get_thread(self, room: str, thread: str) -> Any:
         return self.http.get(f"/api/v1/rooms/{room}/agui/{thread}")
@@ -153,7 +195,7 @@ class Server:
             "POST",
             f"/api/v1/rooms/{room}/agui/{thread}/{run}",
             json=body,
-            headers={"accept": "text/event-stream"},
+            headers={"accept": "text/event-stream"} | self._trace_headers(),
         ) as response:
             out["status"] = response.status_code
             if response.status_code != 200:
@@ -199,18 +241,30 @@ class History:
     def __init__(self, messages: list[dict[str, Any]]):
         self.messages = messages
 
-    def absorb(self, events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    def absorb(
+        self, events: Sequence[Mapping[str, Any]], since: int = 0
+    ) -> dict[str, Any]:
         """Apply one run's events to the history.
 
-        Returns ``final_text`` (the last assistant text in the whole
-        history), ``run_text`` (assistant text started in this run),
-        ``error``, ``tool_calls`` as ``{id, name, args}`` in stream order,
-        and ``tool_results`` as ``{id: content}``.
+        Message ids are looked up among this run's messages only, and tool
+        calls without a ``parentMessageId`` share one assistant message.
+        Returns a dict of:
+
+        - ``final_text``: the last assistant text in ``messages[since:]``
+        - ``run_text``: assistant text started in this run
+        - ``error``: the ``RUN_ERROR`` message, if any
+        - ``duplicate_ids``: tool call ids started twice in this run
+        - ``tool_calls``: ``{id, name, args}`` in stream order
+        - ``tool_results``: ``{id: content}``
+        - ``result_order``: ``(id, content)`` per result, in stream order
         """
-        by_id = {m["id"]: m for m in self.messages}
+        by_id: dict[str, dict[str, Any]] = {}
+        duplicates: list[str] = []
         calls: dict[str, dict[str, Any]] = {}
         results: dict[str, Any] = {}
-        started: list[dict[str, Any]] = []
+        result_order: list[tuple[str, Any]] = []
+        started: dict[str, dict[str, Any]] = {}
+        orphan_parent: str | None = None
         final_text = None
         error = None
         for event in events:
@@ -225,7 +279,7 @@ class History:
                     }
                     self.messages.append(message)
                     by_id[message["id"]] = message
-                started.append(message)
+                started[message["id"]] = message
             elif kind == "TEXT_MESSAGE_CONTENT":
                 message = by_id[event["messageId"]]
                 message["content"] = (message.get("content") or "") + (
@@ -233,7 +287,10 @@ class History:
                 )
                 final_text = message["content"]
             elif kind == "TOOL_CALL_START":
-                parent = event.get("parentMessageId") or str(uuid.uuid4())
+                parent = event.get("parentMessageId")
+                if not parent:
+                    orphan_parent = orphan_parent or str(uuid.uuid4())
+                    parent = orphan_parent
                 message = by_id.get(parent)
                 if message is None:
                     message = {
@@ -252,6 +309,8 @@ class History:
                     },
                 }
                 message.setdefault("toolCalls", []).append(tool_call)
+                if event["toolCallId"] in calls:
+                    duplicates.append(event["toolCallId"])
                 calls[event["toolCallId"]] = tool_call
             elif kind == "TOOL_CALL_ARGS":
                 function = calls[event["toolCallId"]]["function"]
@@ -266,16 +325,23 @@ class History:
                     }
                 )
                 results[event["toolCallId"]] = event.get("content", "")
+                result_order.append(
+                    (event["toolCallId"], event.get("content", ""))
+                )
             elif kind == "RUN_ERROR":
                 error = event.get("message") or json.dumps(event)
-        for message in reversed(self.messages):
+        final_text = None
+        for message in reversed(self.messages[since:]):
             if message["role"] == "assistant" and message.get("content"):
                 final_text = message["content"]
                 break
         return {
             "final_text": final_text,
-            "run_text": "\n".join(m["content"] for m in started),
+            "run_text": "\n".join(
+                m.get("content") or "" for m in started.values()
+            ),
             "error": error,
+            "duplicate_ids": duplicates,
             "tool_calls": [
                 {
                     "id": call_id,
@@ -285,6 +351,7 @@ class History:
                 for call_id, call in calls.items()
             ],
             "tool_results": results,
+            "result_order": result_order,
         }
 
     def add_tool_result(self, call_id: str, content: str) -> None:
@@ -364,6 +431,12 @@ class ClientTool:
         return data
 
 
+class BadMaxRounds(ValueError):
+    def __init__(self, max_rounds: int):
+        self.max_rounds = max_rounds
+        super().__init__(f"max_rounds must be 0 or more, not {max_rounds}")
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ClientProfile:
     """What a client sends with every run, and how it runs the loop.
@@ -381,6 +454,10 @@ class ClientProfile:
     max_rounds: int = 6
     adopt_snapshots: bool = True
     fence: Fence | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_rounds < 0:
+            raise BadMaxRounds(self.max_rounds)
 
 
 @dataclasses.dataclass(slots=True)
@@ -474,9 +551,11 @@ class Session:
         """Send ``text``, then run rounds until the model stops calling.
 
         ``forwarded_props`` and ``context`` replace the profile's values
-        for every run of this turn only. An HTTP refusal or a ``RUN_ERROR``
-        ends the turn with ``error`` set. A failure to create the thread or
-        a run raises.
+        for every run of this turn only. An HTTP refusal, a ``RUN_ERROR``
+        or a run that ends waiting on non-client calls ends the turn with
+        ``error`` set. A failure to create the thread or a run raises.
+        After an error the history can hold a partial run, so a further
+        turn on the same session sends that partial run back.
         """
         profile = self.profile
         props = (
@@ -487,6 +566,7 @@ class Session:
         ctx = list(profile.context if context is None else context)
         tools = {tool.name: tool for tool in profile.tools}
         definitions = [tool.definition() for tool in profile.tools]
+        start = len(self.messages)
         self.messages.append(user_message(text))
         history = History(self.messages)
         turn = TurnResult(user=text, state=self.state)
@@ -525,7 +605,7 @@ class Session:
                 if out["status"] != 200:
                     turn.error = f"HTTP {out['status']}: {out['error_body']}"
                     return turn
-                seen = history.absorb(out["events"])
+                seen = history.absorb(out["events"], since=start)
                 if profile.adopt_snapshots:
                     for event in out["events"]:
                         if event.get("type") == "STATE_SNAPSHOT":
@@ -535,6 +615,10 @@ class Session:
                 self._collect(turn, seen)
                 if seen["error"]:
                     turn.error = seen["error"]
+                    return turn
+                if seen["duplicate_ids"]:
+                    ids = ", ".join(seen["duplicate_ids"])
+                    turn.error = f"{DUPLICATE_CALL_ID}: {ids}"
                     return turn
                 pending = [
                     c
@@ -550,6 +634,10 @@ class Session:
                         turn, history, tools, pending, round_index + 1
                     )
                     continue
+                if pending:
+                    names = ", ".join(c["name"] for c in pending)
+                    turn.error = f"{UNANSWERED}: {names}"
+                    return turn
                 blocks = (
                     fenced_blocks(seen["run_text"], profile.fence.tag)
                     if profile.fence is not None
@@ -577,13 +665,15 @@ class Session:
                 turn.server_calls.append(
                     call | {"result": results[call["id"]]}
                 )
-                turn.tool_results.append(
-                    ToolResult(
-                        name=call["name"],
-                        id=call["id"],
-                        result=results[call["id"]],
-                    )
-                )
+        names = {
+            tool_call["id"]: tool_call["function"]["name"]
+            for message in self.messages
+            for tool_call in message.get("toolCalls") or ()
+        }
+        for call_id, content in seen["result_order"]:
+            turn.tool_results.append(
+                ToolResult(name=names.get(call_id), id=call_id, result=content)
+            )
 
     def _run_client_calls(
         self,
@@ -595,16 +685,31 @@ class Session:
     ) -> None:
         for call in pending:
             tool = tools.get(call["name"])
-            try:
-                args = json.loads(call["args"] or "{}")
-                if tool is None:
-                    result = json.dumps(
-                        {"error": f"unknown tool {call['name']}"}
-                    )
-                else:
-                    result = tool.handler(args)
-            except Exception as exc:  # noqa: BLE001 -- goes to the model
-                result = _error_json(exc)
+            with _span(
+                f"execute_tool {call['name']}",
+                **{
+                    "gen_ai.operation.name": "execute_tool",
+                    "gen_ai.tool.name": call["name"],
+                    "gen_ai.tool.call.id": call["id"],
+                    "gen_ai.tool.call.arguments": _as_json(call["args"]),
+                    "gen_ai.conversation.id": self.thread_id,
+                },
+            ) as span:
+                try:
+                    args = json.loads(call["args"] or "{}")
+                    if tool is None:
+                        result = json.dumps(
+                            {"error": f"unknown tool {call['name']}"}
+                        )
+                    else:
+                        result = tool.handler(args)
+                except Exception as exc:  # noqa: BLE001 -- goes to the model
+                    result = _error_json(exc)
+                if span is not None:
+                    parsed = _as_json(result)
+                    span.set_attribute("gen_ai.tool.call.result", parsed)
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        span.set_level("error")
             turn.client_calls.append(
                 dict(call) | {"round": round_number, "result": result}
             )
@@ -674,6 +779,8 @@ def run_trial(
             failure = f"{type(exc).__name__}: {exc}"
         if span is not None:
             span.set_attribute("thread_id", session.thread_id)
+            for key, value in conversation_attributes(session, turns).items():
+                span.set_attribute(key, value)
     return to_record(
         session,
         turns,
@@ -684,6 +791,106 @@ def run_trial(
         failure=failure,
         metadata=metadata,
     )
+
+
+def otel_messages(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """AG-UI messages as pydantic-ai's OpenTelemetry message parts.
+
+    The shape of ``pydantic_ai.all_messages``: text and ``tool_call``
+    parts per message, and each run of tool messages folded into one
+    ``user`` message of ``tool_call_response`` parts.
+    """
+    names = {
+        tool_call["id"]: tool_call["function"]["name"]
+        for message in messages
+        for tool_call in message.get("toolCalls") or ()
+    }
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if message["role"] == "tool":
+            part = {
+                "type": "tool_call_response",
+                "id": message["toolCallId"],
+                "name": names.get(message["toolCallId"]),
+                "result": _as_json(message.get("content")),
+            }
+            last = out[-1] if out else None
+            if last is not None and last.get("_tool_responses"):
+                last["parts"].append(part)
+            else:
+                out.append(
+                    {"role": "user", "parts": [part], "_tool_responses": True}
+                )
+            continue
+        parts: list[dict[str, Any]] = []
+        if message.get("content"):
+            parts.append({"type": "text", "content": message["content"]})
+        for tool_call in message.get("toolCalls") or ():
+            parts.append(
+                {
+                    "type": "tool_call",
+                    "id": tool_call["id"],
+                    "name": tool_call["function"]["name"],
+                    "arguments": tool_call["function"]["arguments"],
+                }
+            )
+        out.append({"role": message["role"], "parts": parts})
+    for message in out:
+        message.pop("_tool_responses", None)
+    return out
+
+
+def conversation_attributes(
+    session: Session, turns: Sequence[TurnResult]
+) -> dict[str, Any]:
+    """The trial as pydantic-ai's ``invoke_agent`` span attributes.
+
+    Set on a trial span, these make Logfire show every round, tool call,
+    result and the final answer as one chat history. The client's context
+    entries stand in for ``gen_ai.system_instructions``. Values are lists
+    and dicts, so logfire writes ``logfire.json_schema`` itself.
+    """
+    messages = otel_messages(session.messages)
+    final = (
+        messages[-1:]
+        if messages and messages[-1]["role"] == "assistant"
+        else []
+    )
+    attrs: dict[str, Any] = {
+        "gen_ai.operation.name": "invoke_agent",
+        "gen_ai.conversation.id": session.thread_id or "",
+        "logfire.agent_run_candidate.v1": True,
+        "pydantic_ai.all_messages": messages,
+        "gen_ai.input.messages": messages[: len(messages) - len(final)],
+        "gen_ai.output.messages": final,
+    }
+    profile = session.profile
+    if profile.tools:
+        attrs["gen_ai.tool.definitions"] = [
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": dict(tool.parameters),
+            }
+            for tool in profile.tools
+        ]
+    if profile.context:
+        attrs["gen_ai.system_instructions"] = [
+            {
+                "type": "text",
+                "content": "\n".join(
+                    f"{c.get('description')}: {c.get('value')}"
+                    for c in profile.context
+                ),
+            }
+        ]
+    final_text = turns[-1].final_text if turns else None
+    if final_text is not None:
+        attrs["final_result"] = final_text
+    return attrs
 
 
 def to_record(
@@ -703,8 +910,9 @@ def to_record(
     turns), ``trace_id``, the final ``state``, any ``fence_blocks`` and
     ``outcomes``, which names where the tool outcomes came from.
     ``failure`` is an exception that stopped the trial. It becomes
-    ``error``, and ``tool_results`` stays ``None`` because the outcomes
-    were not all captured.
+    ``error``. ``tool_results`` is ``None`` after a failure, or when any
+    recorded call has no captured result (a turn stopped at the round
+    cap, a ``RUN_ERROR`` mid-call): those outcomes are unknown.
     """
     errors = [t.error for t in turns if t.error is not None]
     error = failure or (errors[0] if errors else None)
@@ -722,6 +930,10 @@ def to_record(
     fences = [block for t in turns for block in t.fence_blocks]
     if fences:
         data["fence_blocks"] = fences
+    calls = [c for t in turns for c in t.tool_calls]
+    results = [r for t in turns for r in t.tool_results]
+    answered = {r.id for r in results}
+    unknown = failure is not None or any(c.id not in answered for c in calls)
     return records.TrialRecord(
         cell=cell,
         trial=trial,
@@ -729,12 +941,8 @@ def to_record(
         ok=error is None,
         error=error,
         response=turns[-1].final_text if turns else None,
-        tool_calls=[c for t in turns for c in t.tool_calls],
-        tool_results=(
-            None
-            if failure is not None
-            else [r for t in turns for r in t.tool_results]
-        ),
+        tool_calls=calls,
+        tool_results=None if unknown else results,
         metadata=data,
     )
 
@@ -776,6 +984,9 @@ class Served:
     url: str
     log: pathlib.Path
     port: int
+    preconditions: list[preconditions.Result] = dataclasses.field(
+        default_factory=list
+    )
 
 
 def free_port() -> int:
@@ -793,6 +1004,77 @@ def rooms_ready(url: str) -> bool:
         return False
 
 
+#: The module name of the copied :mod:`asgi_trace` in a server.
+ASGI_TRACE_MODULE = "lab_harness_asgi_trace"
+
+#: ``soliplex-cli audit`` sections run before a server starts. ``audit
+#: all`` also audits Ollama, which raises on an installation without a
+#: ``haiku.rag.yaml``.
+AUDIT_SECTIONS = ("installation", "rooms", "skills")
+
+#: ``(argv, env) -> (returncode, stdout, stderr)``.
+AuditRunner = Callable[
+    [Sequence[str], Mapping[str, str]], tuple[int, str, str]
+]
+
+
+def run_audit_command(
+    argv: Sequence[str], env: Mapping[str, str]
+) -> tuple[int, str, str]:
+    done = subprocess.run(
+        list(argv), env=dict(env), capture_output=True, text=True, check=False
+    )
+    return done.returncode, done.stdout, done.stderr
+
+
+def _launcher(command: Sequence[str] | None, environment: Any) -> list[str]:
+    if command is not None and environment is not None:
+        raise ConflictingLauncher
+    if environment is not None:
+        return [str(environment.python.parent / "soliplex-cli")]
+    return list(command or ["soliplex-cli"])
+
+
+def _tail(text: str, limit: int = 2000) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else "..." + text[-limit:]
+
+
+def audit(
+    installation: pathlib.Path,
+    *,
+    command: Sequence[str] | None = None,
+    environment: Any = None,
+    env: Mapping[str, str] | None = None,
+    sections: Sequence[str] = AUDIT_SECTIONS,
+    cell: str | None = None,
+    runner: AuditRunner = run_audit_command,
+) -> list[preconditions.Result]:
+    """Run ``soliplex-cli audit -q <section>`` on ``installation``.
+
+    The launcher and ``env`` are those of :func:`serve`. One result per
+    section, in order, stopping after the first non-zero exit. A failed
+    result's detail holds the JSON error report and stderr.
+    """
+    argv = _launcher(command, environment)
+    full_env = dict(os.environ, **(env or {}))
+    name = cell if cell is not None else str(installation)
+    results = []
+    for section in sections:
+        code, out, err = runner(
+            [*argv, "audit", "-q", section, str(installation)], full_env
+        )
+        detail = "" if code == 0 else _tail(f"exit {code}: {out}\n{err}")
+        results.append(
+            preconditions.Result(
+                name, f"soliplex-cli audit {section}", code == 0, detail
+            )
+        )
+        if code != 0:
+            break
+    return results
+
+
 @contextlib.contextmanager
 def serve(
     installation: pathlib.Path,
@@ -803,36 +1085,72 @@ def serve(
     port: int | None = None,
     env: Mapping[str, str] | None = None,
     timeout_s: float = 180.0,
+    audit_sections: Sequence[str] = AUDIT_SECTIONS,
+    link_traces: bool | None = None,
+    audit_runner: AuditRunner = run_audit_command,
     spawn: Callable[..., Any] = subprocess.Popen,
     ready: Callable[[str], bool] = rooms_ready,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> Iterator[Served]:
-    """Run ``soliplex-cli serve --no-auth-mode`` until the block exits.
+    """Audit, then run ``soliplex-cli serve --no-auth-mode`` in the block.
 
     The CLI is ``command`` (an argv prefix, such as ``["uv", "run",
     "--directory", <checkout>, "soliplex-cli"]``), else the ``soliplex-cli``
     beside an ``environs.Environment``'s python, else ``soliplex-cli`` on
-    ``PATH``. ``env`` is added to this process's environment. Output goes
-    to ``log``. Waits until ``ready(url)``, and raises
-    :class:`ServerExited` or :class:`ServerNotReady` when that fails.
+    ``PATH``. ``env`` is added to this process's environment.
+
+    :func:`audit` runs ``audit_sections`` first with the same launcher and
+    environment, and a failed section raises ``preconditions.Failed``
+    before the server starts. The passing results are
+    ``Served.preconditions``. Server output goes to ``log``. Waits until
+    ``ready(url)``, and raises :class:`ServerExited` or
+    :class:`ServerNotReady` when that fails.
+
+    ``link_traces`` serves the app through :mod:`asgi_trace`, so each run's
+    server spans join the client's trace. It defaults to whether
+    :func:`configure_telemetry` has run in this process.
     """
-    if command is not None and environment is not None:
-        raise ConflictingLauncher
-    if environment is not None:
-        argv = [str(environment.python.parent / "soliplex-cli")]
-    else:
-        argv = list(command or ["soliplex-cli"])
+    prefix = _launcher(command, environment)
+    checks = audit(
+        installation,
+        command=prefix,
+        env=env,
+        sections=audit_sections,
+        runner=audit_runner,
+    )
+    preconditions.assert_ok(checks)
     port = port or free_port()
-    argv += ["serve", str(installation), "--no-auth-mode", "--port", str(port)]
+    argv = [
+        *prefix,
+        "serve",
+        str(installation),
+        "--no-auth-mode",
+        "--port",
+        str(port),
+    ]
     url = f"http://127.0.0.1:{port}"
     log.parent.mkdir(parents=True, exist_ok=True)
+    server_env = dict(os.environ, **(env or {}))
+    if _configured if link_traces is None else link_traces:
+        shim = log.parent / "lab_harness_asgi"
+        shim.mkdir(exist_ok=True)
+        source = pathlib.Path(__file__).with_name("asgi_trace.py")
+        (shim / f"{ASGI_TRACE_MODULE}.py").write_text(source.read_text())
+        paths = [str(shim), server_env.get("PYTHONPATH", "")]
+        server_env["PYTHONPATH"] = os.pathsep.join(p for p in paths if p)
+        argv += [
+            "--workers",
+            "1",
+            "--app-factory-name",
+            f"{ASGI_TRACE_MODULE}:app",
+        ]
     with log.open("w") as handle:
         process = spawn(
             argv,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            env=dict(os.environ, **(env or {})),
+            env=server_env,
         )
     try:
         deadline = clock() + timeout_s
@@ -842,13 +1160,16 @@ def serve(
             if clock() > deadline:
                 raise ServerNotReady(url, timeout_s, log)
             sleep(1)
-        yield Served(url=url, log=log, port=port)
+        if process.poll() is not None:
+            raise ServerExited(process.returncode, log)
+        yield Served(url=url, log=log, port=port, preconditions=checks)
     finally:
         process.terminate()
         try:
             process.wait(timeout=20)
         except subprocess.TimeoutExpired:  # pragma: no cover
             process.kill()
+            process.wait(timeout=20)
 
 
 # -- telemetry ---------------------------------------------------------
@@ -865,8 +1186,9 @@ def configure_telemetry(
 ) -> None:
     """Configure logfire once per process, for traces that cross HTTP.
 
-    Instruments httpx, which adds a W3C ``traceparent`` to every request.
-    Sends only when ``LOGFIRE_TOKEN`` is set, by default. Scrubbing is off
+    httpx is not instrumented: :class:`Server` writes ``traceparent`` into
+    its POSTs itself, so no span is opened per HTTP call. Sends only when
+    ``LOGFIRE_TOKEN`` is set, by default. Scrubbing is off
     by default because it redacts tool arguments that mention words such
     as "token" or "secret", which are the arguments a trial inspects.
     """
@@ -885,7 +1207,6 @@ def configure_telemetry(
         scrubbing=scrubbing,
         distributed_tracing=True,
     )
-    logfire.instrument_httpx(capture_headers=False)
     _configured = True
 
 

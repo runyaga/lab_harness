@@ -36,9 +36,22 @@ class TrialsFailed(ExceptionGroup):
     """Some trials of a :func:`top_up_async` call raised."""
 
     def __new__(cls, failures: list[Exception], attempted: int):
-        return super().__new__(
-            cls, f"{len(failures)} of {attempted} trials failed", failures
+        group = super().__new__(
+            cls, cls._message(failures, attempted), failures
         )
+        group.attempted = attempted
+        return group
+
+    def __init__(self, failures: list[Exception], attempted: int):
+        super().__init__(self._message(failures, attempted), failures)
+
+    @staticmethod
+    def _message(failures: list[Exception], attempted: int) -> str:
+        return f"{len(failures)} of {attempted} trials failed"
+
+    def derive(self, excs: list[Exception]) -> TrialsFailed:
+        """Keep the class through ``except*`` and ``split``."""
+        return TrialsFailed(list(excs), self.attempted)
 
 
 @dataclasses.dataclass(slots=True)
@@ -211,7 +224,10 @@ async def top_up_async(
     trial 1, and only the missing indices run again.
 
     Each record is appended as it completes, from the event loop's thread,
-    so appends never interleave. ``on_trial`` runs after the append.
+    so appends never interleave. One call owns ``path``: two concurrent
+    calls on the same file compute the same missing set and duplicate
+    trials. ``on_trial`` runs after the append, and an exception from it
+    is reported with the failed trials although its record is on disk.
 
     A trial that raises does not stop the others: every in-flight trial
     finishes and is recorded, and then the failures are raised together as
@@ -220,7 +236,8 @@ async def top_up_async(
     """
     if max_concurrency < 1:
         raise BadConcurrency(max_concurrency)
-    missing = [t for t in range(trials) if t not in completed_trials(path)]
+    done = completed_trials(path)
+    missing = [t for t in range(trials) if t not in done]
     if not missing:
         return 0
     gate = asyncio.Semaphore(max_concurrency)
@@ -237,6 +254,11 @@ async def top_up_async(
     outcomes = await asyncio.gather(
         *(one(trial) for trial in missing), return_exceptions=True
     )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException) and not isinstance(
+            outcome, Exception
+        ):
+            raise outcome
     failures = [o for o in outcomes if isinstance(o, Exception)]
     if failures:
         raise TrialsFailed(failures, len(missing))

@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from soliplex_lab_harness import agui
+from soliplex_lab_harness import preconditions
 from soliplex_lab_harness import scoring
 from soliplex_lab_harness.collect import ToolCall
 from soliplex_lab_harness.collect import ToolResult
@@ -806,6 +807,7 @@ def test_serve_launches_and_waits_for_rooms(tmp_path):
         command=["uv", "run", "soliplex-cli"],
         port=8123,
         env={"EXTRA": "1"},
+        audit_runner=FakeAudit(),
         spawn=spawn,
         ready=lambda url: next(answers),
         sleep=lambda s: None,
@@ -844,6 +846,7 @@ def test_serve_uses_the_environments_cli(tmp_path):
         log=tmp_path / "s.log",
         environment=env,
         port=1,
+        audit_runner=FakeAudit(),
         spawn=spawn,
         ready=lambda url: True,
         sleep=lambda s: None,
@@ -879,6 +882,7 @@ def test_serve_reports_an_exited_server(tmp_path):
             tmp_path / "i.yaml",
             log=tmp_path / "s.log",
             port=1,
+            audit_runner=FakeAudit(),
             spawn=lambda argv, **kw: FakeProcess(exit_after=0),
             ready=lambda url: False,
             sleep=lambda s: None,
@@ -898,6 +902,7 @@ def test_serve_gives_up_after_the_timeout(tmp_path):
             log=tmp_path / "s.log",
             port=1,
             timeout_s=30,
+            audit_runner=FakeAudit(),
             spawn=lambda argv, **kw: process,
             ready=lambda url: False,
             sleep=lambda s: None,
@@ -935,9 +940,13 @@ class StubSpan:
     def __init__(self, name, attributes):
         self.name = name
         self.attributes = dict(attributes)
+        self.level = "info"
 
     def set_attribute(self, key, value):
         self.attributes[key] = value
+
+    def set_level(self, level):
+        self.level = level
 
     def get_span_context(self):
         return StubContext()
@@ -966,10 +975,12 @@ def test_trial_and_rounds_open_spans(monkeypatch):
     assert [s.name for s in spans] == [
         "trial {cell} t{trial}",
         "client round {round}",
+        "execute_tool run_monty",
         "client round {round}",
     ]
     assert spans[0].attributes["thread_id"] == THREAD
-    assert [s.attributes["run_id"] for s in spans[1:]] == ["run-0", "run-1"]
+    rounds = [s for s in spans if s.name == "client round {round}"]
+    assert [s.attributes["run_id"] for s in rounds] == ["run-0", "run-1"]
 
 
 def test_trace_id_of_no_span_is_none():
@@ -1014,3 +1025,782 @@ def test_to_record_with_a_failure_has_no_outcomes():
     assert record.error == "boom"
     assert record.tool_results is None
     assert record.response is None
+
+
+# -- audit -------------------------------------------------------------
+
+
+class FakeAudit:
+    """An injected audit runner: one (returncode, stdout, stderr) per call."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def __call__(self, argv, env):
+        self.calls.append((list(argv), dict(env)))
+        if self.outcomes:
+            return self.outcomes.pop(0)
+        return (0, "", "")
+
+
+def test_audit_runs_three_sections_with_the_servers_launcher(tmp_path):
+    runner = FakeAudit()
+
+    results = agui.audit(
+        tmp_path / "installation.yaml",
+        command=["uv", "run", "soliplex-cli"],
+        env={"PYTHONPATH": "/bench"},
+        cell="baseline",
+        runner=runner,
+    )
+
+    assert [argv for argv, _ in runner.calls] == [
+        [
+            "uv",
+            "run",
+            "soliplex-cli",
+            "audit",
+            "-q",
+            section,
+            str(tmp_path / "installation.yaml"),
+        ]
+        for section in ("installation", "rooms", "skills")
+    ]
+    assert all(env["PYTHONPATH"] == "/bench" for _, env in runner.calls)
+    assert [r.what for r in results] == [
+        "soliplex-cli audit installation",
+        "soliplex-cli audit rooms",
+        "soliplex-cli audit skills",
+    ]
+    assert all(r.ok and r.cell == "baseline" for r in results)
+    preconditions.assert_ok(results)
+
+
+def test_audit_uses_the_environments_cli(tmp_path):
+    from soliplex_lab_harness import environs
+
+    env = environs.Environment(
+        root=tmp_path / "venv", pin=environs.Pin(name="v", version="1")
+    )
+    runner = FakeAudit()
+
+    agui.audit(tmp_path / "i.yaml", environment=env, runner=runner)
+
+    assert runner.calls[0][0][0] == str(env.python.parent / "soliplex-cli")
+
+
+def test_audit_stops_at_the_first_failing_section(tmp_path):
+    runner = FakeAudit(
+        (0, "", ""),
+        (1, '{"room": {"mc_ctx": "unknown tool"}}', "warning text"),
+    )
+
+    results = agui.audit(tmp_path / "i.yaml", runner=runner)
+
+    assert len(runner.calls) == 2
+    assert [r.ok for r in results] == [True, False]
+    assert "unknown tool" in results[1].detail
+    assert "warning text" in results[1].detail
+    with pytest.raises(preconditions.Failed, match="audit rooms"):
+        preconditions.assert_ok(results)
+
+
+def test_audit_cell_defaults_to_the_installation_path(tmp_path):
+    results = agui.audit(tmp_path / "i.yaml", runner=FakeAudit())
+
+    assert results[0].cell == str(tmp_path / "i.yaml")
+
+
+def test_serve_audits_before_it_spawns(tmp_path):
+    order = []
+    runner = FakeAudit()
+
+    def audit_runner(argv, env):
+        order.append("audit")
+        return runner(argv, env)
+
+    def spawn(argv, **kwargs):
+        order.append("spawn")
+        return FakeProcess()
+
+    with agui.serve(
+        tmp_path / "i.yaml",
+        log=tmp_path / "s.log",
+        command=["soliplex-cli"],
+        port=1,
+        env={"PYTHONPATH": "/bench"},
+        spawn=spawn,
+        audit_runner=audit_runner,
+        ready=lambda url: True,
+        sleep=lambda s: None,
+    ) as served:
+        assert len(served.preconditions) == 3
+
+    assert order == ["audit", "audit", "audit", "spawn"]
+    assert runner.calls[0][1]["PYTHONPATH"] == "/bench"
+
+
+def test_serve_refuses_to_start_on_a_failed_audit(tmp_path):
+    def spawn(argv, **kwargs):  # pragma: no cover -- must not be called
+        raise AssertionError
+
+    with (
+        pytest.raises(preconditions.Failed, match="audit installation"),
+        agui.serve(
+            tmp_path / "i.yaml",
+            log=tmp_path / "s.log",
+            port=1,
+            spawn=spawn,
+            audit_runner=FakeAudit((1, "{}", "bad yaml")),
+        ),
+    ):
+        pass  # pragma: no cover
+
+
+def test_serve_without_audit_sections_skips_the_audit(tmp_path):
+    with agui.serve(
+        tmp_path / "i.yaml",
+        log=tmp_path / "s.log",
+        port=1,
+        audit_sections=(),
+        spawn=lambda argv, **kw: FakeProcess(),
+        audit_runner=FakeAudit((1, "", "")),
+        ready=lambda url: True,
+        sleep=lambda s: None,
+    ) as served:
+        assert served.preconditions == []
+
+
+# -- review fixes ------------------------------------------------------
+
+
+def test_unanswered_non_client_call_ends_the_turn_with_an_error():
+    fake = FakeSoliplex([framed(call("x1", "needs_approval", "{}"))])
+    session = agui.Session(fake.server(), ROOM)
+
+    turn = session.turn("go")
+
+    assert turn.error == "unanswered tool calls: needs_approval"
+    assert len(fake.bodies) == 1
+
+
+def test_parentless_calls_in_one_run_share_one_assistant_message():
+    events = []
+    for call_id in ("c1", "c2"):
+        events += call(call_id, "run_monty", '{"code": "x"}', parent=None)
+    fake = FakeSoliplex([framed(events), framed(text("a2", "done"))])
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+
+    session.turn("go")
+
+    sent = fake.bodies[1]["messages"]
+    assert [m["role"] for m in sent] == ["user", "assistant", "tool", "tool"]
+    assert [c["id"] for c in sent[1]["toolCalls"]] == ["c1", "c2"]
+
+
+def test_text_start_without_content_on_a_tool_parent():
+    events = call("c1", "run_monty", '{"code": "x"}', parent="a1") + [
+        {"type": "TEXT_MESSAGE_START", "messageId": "a1"},
+        {"type": "TEXT_MESSAGE_END", "messageId": "a1"},
+    ]
+    fake = FakeSoliplex([framed(events), framed(text("a2", "done"))])
+    profile = agui.ClientProfile(
+        tools=(echo_tool(),), fence=agui.Fence("monty", lambda code: "1")
+    )
+    session = agui.Session(fake.server(), ROOM, profile)
+
+    turn = session.turn("go")
+
+    assert turn.final_text == "done"
+
+
+def test_repeated_text_start_does_not_run_a_fence_twice():
+    events = text("a1", "```monty\nx\n```") + [
+        {"type": "TEXT_MESSAGE_START", "messageId": "a1"},
+    ]
+    fake = FakeSoliplex([framed(events), framed(text("a2", "done"))])
+    profile = agui.ClientProfile(fence=agui.Fence("monty", lambda code: "1"))
+    session = agui.Session(fake.server(), ROOM, profile)
+
+    turn = session.turn("go")
+
+    assert len(turn.fence_blocks) == 1
+
+
+def test_results_keep_stream_order():
+    events = (
+        call("s1", "first", "{}")
+        + call("s2", "second", "{}")
+        + result("s2", "two")
+        + result("s1", "one")
+        + text("a2", "done")
+    )
+    fake = FakeSoliplex([framed(events)])
+    session = agui.Session(fake.server(), ROOM)
+
+    turn = session.turn("go")
+
+    assert [r.id for r in turn.tool_results] == ["s2", "s1"]
+    assert [r.name for r in turn.tool_results] == ["second", "first"]
+
+
+def test_negative_max_rounds_is_refused():
+    with pytest.raises(agui.BadMaxRounds):
+        agui.ClientProfile(max_rounds=-1)
+
+
+def test_serve_checks_the_process_after_ready(tmp_path):
+    with (
+        pytest.raises(agui.ServerExited),
+        agui.serve(
+            tmp_path / "i.yaml",
+            log=tmp_path / "s.log",
+            port=1,
+            audit_runner=FakeAudit(),
+            spawn=lambda argv, **kw: FakeProcess(exit_after=0),
+            ready=lambda url: True,
+            sleep=lambda s: None,
+        ),
+    ):
+        pass  # pragma: no cover
+
+
+# -- trace linking -----------------------------------------------------
+
+
+def test_serve_links_traces_through_the_asgi_wrapper(tmp_path):
+    launched = {}
+
+    def spawn(argv, **kwargs):
+        launched["argv"] = argv
+        launched["env"] = kwargs["env"]
+        return FakeProcess()
+
+    with agui.serve(
+        tmp_path / "i.yaml",
+        log=tmp_path / "work" / "s.log",
+        command=["soliplex-cli"],
+        port=8,
+        env={"PYTHONPATH": "/bench"},
+        link_traces=True,
+        audit_runner=FakeAudit(),
+        spawn=spawn,
+        ready=lambda url: True,
+        sleep=lambda s: None,
+    ):
+        pass
+
+    argv = launched["argv"]
+    assert argv[-4:] == [
+        "--workers",
+        "1",
+        "--app-factory-name",
+        f"{agui.ASGI_TRACE_MODULE}:app",
+    ]
+    shim = launched["env"]["PYTHONPATH"].split(":")
+    assert shim[1] == "/bench"
+    copied = pathlib.Path(shim[0]) / f"{agui.ASGI_TRACE_MODULE}.py"
+    assert "class TraceparentMiddleware" in copied.read_text()
+
+
+def test_serve_does_not_link_traces_when_off(tmp_path):
+    launched = {}
+
+    def spawn(argv, **kwargs):
+        launched["argv"] = argv
+        return FakeProcess()
+
+    with agui.serve(
+        tmp_path / "i.yaml",
+        log=tmp_path / "s.log",
+        port=8,
+        link_traces=False,
+        audit_runner=FakeAudit(),
+        spawn=spawn,
+        ready=lambda url: True,
+        sleep=lambda s: None,
+    ):
+        pass
+
+    assert "--app-factory-name" not in launched["argv"]
+
+
+def test_link_traces_defaults_to_whether_telemetry_is_configured(
+    tmp_path, monkeypatch
+):
+    seen = []
+
+    def spawn(argv, **kwargs):
+        seen.append("--app-factory-name" in argv)
+        return FakeProcess()
+
+    for configured in (False, True):
+        monkeypatch.setattr(agui, "_configured", configured)
+        with agui.serve(
+            tmp_path / "i.yaml",
+            log=tmp_path / "s.log",
+            port=8,
+            audit_runner=FakeAudit(),
+            spawn=spawn,
+            ready=lambda url: True,
+            sleep=lambda s: None,
+        ):
+            pass
+
+    assert seen == [False, True]
+
+
+def recording_spans(monkeypatch):
+    import contextlib
+
+    spans = []
+
+    @contextlib.contextmanager
+    def stub_span(name, **attributes):
+        span = StubSpan(name, attributes)
+        spans.append(span)
+        yield span
+
+    monkeypatch.setattr(agui, "_span", stub_span)
+    return spans
+
+
+def test_client_tool_runs_in_an_execute_tool_span(monkeypatch):
+    spans = recording_spans(monkeypatch)
+    fake = FakeSoliplex(
+        [
+            framed(call("c1", "run_monty", '{"code": "1 + 1"}')),
+            framed(text("a2", "2")),
+        ]
+    )
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+
+    session.turn("go")
+
+    (tool,) = [s for s in spans if s.name.startswith("execute_tool")]
+    assert tool.name == "execute_tool run_monty"
+    assert tool.attributes == {
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.name": "run_monty",
+        "gen_ai.tool.call.id": "c1",
+        "gen_ai.tool.call.arguments": {"code": "1 + 1"},
+        "gen_ai.conversation.id": THREAD,
+        "gen_ai.tool.call.result": {"value": "1 + 1"},
+    }
+    assert tool.level == "info"
+
+
+def test_execute_tool_span_is_an_error_when_the_handler_raises(monkeypatch):
+    spans = recording_spans(monkeypatch)
+
+    def boom(args):
+        raise HostFunctionMissing
+
+    fake = FakeSoliplex(
+        [
+            framed(call("c1", "run_monty", '{"code": "x"}')),
+            framed(text("a2", "sorry")),
+        ]
+    )
+    profile = agui.ClientProfile(tools=(echo_tool(handler=boom),))
+    agui.Session(fake.server(), ROOM, profile).turn("go")
+
+    (tool,) = [s for s in spans if s.name.startswith("execute_tool")]
+    assert tool.level == "error"
+    assert tool.attributes["gen_ai.tool.call.result"]["error"]["type"] == (
+        "HostFunctionMissing"
+    )
+
+
+def test_execute_tool_span_is_an_error_when_the_result_is_one(monkeypatch):
+    spans = recording_spans(monkeypatch)
+    failing = echo_tool(handler=lambda args: json.dumps({"error": "bad"}))
+    fake = FakeSoliplex(
+        [
+            framed(call("c1", "run_monty", '{"code": "x"}')),
+            framed(text("a2", "sorry")),
+        ]
+    )
+    agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(failing,))
+    ).turn("go")
+
+    (tool,) = [s for s in spans if s.name.startswith("execute_tool")]
+    assert tool.level == "error"
+
+
+def test_run_post_carries_the_injected_traceparent(monkeypatch):
+    spans = recording_spans(monkeypatch)
+    headers = []
+
+    def handler(request):
+        headers.append(request.headers.get("traceparent"))
+        return fake.handler(request)
+
+    def inject(carrier):
+        carrier["traceparent"] = "00-trace-span-01"
+
+    fake = FakeSoliplex([framed(text("a1", "hi"))])
+    server = agui.Server(
+        "http://soliplex.test",
+        transport=httpx.MockTransport(handler),
+        inject=inject,
+    )
+
+    server.post_run(ROOM, THREAD, "run-0", {"threadId": THREAD})
+
+    assert headers == ["00-trace-span-01"]
+    assert spans == []
+
+
+def test_server_injects_with_opentelemetry_when_present(monkeypatch):
+    import sys
+    import types
+
+    propagate = types.ModuleType("opentelemetry.propagate")
+    propagate.inject = lambda carrier: carrier.update(traceparent="00-x")
+    package = types.ModuleType("opentelemetry")
+    package.propagate = propagate
+    monkeypatch.setitem(sys.modules, "opentelemetry", package)
+    monkeypatch.setitem(sys.modules, "opentelemetry.propagate", propagate)
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("traceparent"))
+        return httpx.Response(200, json={"run_id": "r"})
+
+    server = agui.Server(
+        "http://soliplex.test", transport=httpx.MockTransport(handler)
+    )
+    server.new_run(ROOM, THREAD)
+
+    assert seen == ["00-x"]
+
+
+def test_configure_telemetry_does_not_instrument_httpx(monkeypatch):
+    import sys
+    import types
+
+    calls = []
+    fake_logfire = types.ModuleType("logfire")
+    fake_logfire.configure = lambda **kw: calls.append(("configure", kw))
+    fake_logfire.instrument_httpx = lambda **kw: calls.append(("httpx", kw))
+    monkeypatch.setitem(sys.modules, "logfire", fake_logfire)
+    monkeypatch.setattr(agui, "_configured", False)
+
+    agui.configure_telemetry("svc", environment="env")
+
+    assert [c[0] for c in calls] == ["configure"]
+    assert calls[0][1]["distributed_tracing"] is True
+
+
+# -- conversation on the trial span -------------------------------------
+
+
+def test_conversation_attributes_in_pydantic_ai_run_span_format():
+    fake = two_round_fake()
+    profile = agui.ClientProfile(
+        tools=(echo_tool(),),
+        context=({"description": "units", "value": "metric"},),
+    )
+    session = agui.Session(fake.server(), ROOM, profile)
+    turn = session.turn("go")
+
+    attrs = agui.conversation_attributes(session, [turn])
+
+    assert attrs["gen_ai.operation.name"] == "invoke_agent"
+    assert attrs["gen_ai.conversation.id"] == THREAD
+    assert attrs["logfire.agent_run_candidate.v1"] is True
+    assert attrs["final_result"] == "Total 769.59"
+    retry = (
+        "Unknown tool name: 'invented_tool'. Available tools: "
+        "'run_monty'\n\nFix the errors and try again."
+    )
+
+    def calls(*parts):
+        return {"role": "assistant", "parts": list(parts)}
+
+    def responses(*parts):
+        return {"role": "user", "parts": list(parts)}
+
+    # The fixture's two calls have different parent messages (a1, a2).
+    assert attrs["pydantic_ai.all_messages"] == [
+        {"role": "user", "parts": [{"type": "text", "content": "go"}]},
+        calls(
+            {
+                "type": "tool_call",
+                "id": "s1",
+                "name": "invented_tool",
+                "arguments": "{}",
+            }
+        ),
+        responses(
+            {
+                "type": "tool_call_response",
+                "id": "s1",
+                "name": "invented_tool",
+                "result": retry,
+            }
+        ),
+        calls(
+            {
+                "type": "tool_call",
+                "id": "c1",
+                "name": "run_monty",
+                "arguments": '{"code": "x"}',
+            }
+        ),
+        responses(
+            {
+                "type": "tool_call_response",
+                "id": "c1",
+                "name": "run_monty",
+                "result": {"value": "x"},
+            }
+        ),
+        {
+            "role": "assistant",
+            "parts": [{"type": "text", "content": "Total 769.59"}],
+        },
+    ]
+    assert (
+        attrs["gen_ai.input.messages"]
+        == (attrs["pydantic_ai.all_messages"][:-1])
+    )
+    assert (
+        attrs["gen_ai.output.messages"]
+        == (attrs["pydantic_ai.all_messages"][-1:])
+    )
+    assert attrs["gen_ai.tool.definitions"] == [
+        {
+            "type": "function",
+            "name": "run_monty",
+            "description": "run code",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    assert attrs["gen_ai.system_instructions"] == [
+        {"type": "text", "content": "units: metric"}
+    ]
+
+
+def test_conversation_attributes_include_fence_exchanges():
+    fake = FakeSoliplex(
+        [
+            framed(text("a1", "```monty\n1 + 1\n```")),
+            framed(text("a2", "2")),
+        ]
+    )
+    profile = agui.ClientProfile(fence=agui.Fence("monty", lambda c: "2"))
+    session = agui.Session(fake.server(), ROOM, profile)
+    turn = session.turn("add")
+
+    attrs = agui.conversation_attributes(session, [turn])
+
+    texts = [
+        (m["role"], m["parts"][0]["content"])
+        for m in attrs["pydantic_ai.all_messages"]
+    ]
+    assert texts == [
+        ("user", "add"),
+        ("assistant", "```monty\n1 + 1\n```"),
+        ("user", "monty result:\n2"),
+        ("assistant", "2"),
+    ]
+    assert "gen_ai.tool.definitions" not in attrs
+    assert "gen_ai.system_instructions" not in attrs
+
+
+def test_conversation_without_a_final_answer_has_no_output():
+    fake = FakeSoliplex([422])
+    session = agui.Session(fake.server(), ROOM)
+    turn = session.turn("go")
+
+    attrs = agui.conversation_attributes(session, [turn])
+
+    assert attrs["gen_ai.output.messages"] == []
+    assert "final_result" not in attrs
+
+
+def test_run_trial_puts_the_conversation_on_the_trial_span(monkeypatch):
+    spans = recording_spans(monkeypatch)
+    fake = two_round_fake()
+
+    agui.run_trial(
+        fake.server(),
+        ROOM,
+        "go",
+        cell="c",
+        trial=0,
+        profile=agui.ClientProfile(tools=(echo_tool(),)),
+    )
+
+    trial = spans[0]
+    assert trial.name == "trial {cell} t{trial}"
+    assert trial.attributes["gen_ai.operation.name"] == "invoke_agent"
+    assert len(trial.attributes["pydantic_ai.all_messages"]) == 6
+
+
+def test_consecutive_tool_results_fold_into_one_message():
+    messages = [
+        {"id": "u", "role": "user", "content": "go"},
+        {
+            "id": "a",
+            "role": "assistant",
+            "content": "Checking.",
+            "toolCalls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "one", "arguments": "{}"},
+                },
+                {
+                    "id": "c2",
+                    "type": "function",
+                    "function": {"name": "two", "arguments": "{}"},
+                },
+            ],
+        },
+        {"id": "t1", "role": "tool", "toolCallId": "c1", "content": "1"},
+        {"id": "t2", "role": "tool", "toolCallId": "c2", "content": "x"},
+    ]
+
+    out = agui.otel_messages(messages)
+
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]
+    assert [p["type"] for p in out[1]["parts"]] == [
+        "text",
+        "tool_call",
+        "tool_call",
+    ]
+    assert out[2]["parts"] == [
+        {"type": "tool_call_response", "id": "c1", "name": "one", "result": 1},
+        {
+            "type": "tool_call_response",
+            "id": "c2",
+            "name": "two",
+            "result": "x",
+        },
+    ]
+
+
+# -- agy review fixes --------------------------------------------------
+
+
+def test_duplicate_tool_call_id_in_a_run_is_an_error():
+    events = (
+        call("c1", "agui_context", "{}")
+        + result("c1", "ctx")
+        + call("c1", "run_monty", '{"code": "x"}', parent="a2")
+    )
+    fake = FakeSoliplex([framed(events)])
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+
+    turn = session.turn("go")
+
+    assert turn.error == f"{agui.DUPLICATE_CALL_ID}: c1"
+    assert turn.client_calls == []
+
+
+def test_message_id_from_an_earlier_run_starts_a_new_message():
+    fake = FakeSoliplex(
+        [
+            framed(text("m1", "first") + call("c1", "run_monty", "{}", "m1")),
+            framed(text("m1", "second")),
+        ]
+    )
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+
+    turn = session.turn("go")
+
+    contents = [
+        m.get("content") for m in session.messages if m["role"] == "assistant"
+    ]
+    assert contents == ["first", "second"]
+    assert turn.final_text == "second"
+
+
+def test_final_text_comes_from_this_turn_only():
+    fake = FakeSoliplex([framed(text("a1", "one")), framed([])])
+    session = agui.Session(fake.server(), ROOM)
+
+    session.turn("first")
+    second = session.turn("second")
+
+    assert second.final_text is None
+
+
+def test_record_has_no_outcomes_when_a_call_has_none():
+    loop = [
+        framed(call(f"c{i}", "run_monty", '{"code": "x"}', parent=f"a{i}"))
+        for i in range(2)
+    ]
+    fake = FakeSoliplex(loop)
+    profile = agui.ClientProfile(tools=(echo_tool(),), max_rounds=1)
+
+    record = agui.run_trial(
+        fake.server(), ROOM, "go", cell="c", trial=0, profile=profile
+    )
+
+    assert record.error == agui.MAX_ROUNDS
+    assert record.call_names == ["run_monty", "run_monty"]
+    assert record.tool_results is None
+    assert scoring.retry_count(record) is None
+
+
+def test_record_keeps_outcomes_when_every_call_has_one():
+    fake = FakeSoliplex([422])
+
+    record = agui.run_trial(fake.server(), ROOM, "go", cell="c", trial=0)
+
+    assert record.tool_calls == []
+    assert record.tool_results == []
+
+
+def test_server_reads_threads_and_runs():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.content))
+        return httpx.Response(200, json={})
+
+    server = agui.Server(
+        "http://soliplex.test", transport=httpx.MockTransport(handler)
+    )
+    server.get_thread(ROOM, THREAD)
+    server.get_run(ROOM, THREAD, "r1")
+    server.new_run(ROOM, THREAD, parent_run_id="r1")
+    server.close()
+
+    assert seen == [
+        ("GET", f"/api/v1/rooms/{ROOM}/agui/{THREAD}", b""),
+        ("GET", f"/api/v1/rooms/{ROOM}/agui/{THREAD}/r1", b""),
+        (
+            "POST",
+            f"/api/v1/rooms/{ROOM}/agui/{THREAD}",
+            b'{"parent_run_id":"r1"}',
+        ),
+    ]
+
+
+def test_no_top_level_import_of_server_side_packages():
+    import ast
+
+    for module in (agui,):
+        tree = ast.parse(pathlib.Path(module.__file__).read_text())
+        names = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                names |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names.add(node.module.split(".")[0])
+        assert not names & {"httpx", "logfire", "opentelemetry", "soliplex"}
