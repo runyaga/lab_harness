@@ -1572,10 +1572,9 @@ def test_conversation_attributes_in_pydantic_ai_run_span_format():
         attrs["gen_ai.input.messages"]
         == (attrs["pydantic_ai.all_messages"][:-1])
     )
-    assert (
-        attrs["gen_ai.output.messages"]
-        == (attrs["pydantic_ai.all_messages"][-1:])
-    )
+    assert attrs["gen_ai.output.messages"] == [
+        attrs["pydantic_ai.all_messages"][-1] | {"finish_reason": "stop"}
+    ]
     assert attrs["gen_ai.tool.definitions"] == [
         {
             "type": "function",
@@ -1804,3 +1803,259 @@ def test_no_top_level_import_of_server_side_packages():
             elif isinstance(node, ast.ImportFrom) and node.module:
                 names.add(node.module.split(".")[0])
         assert not names & {"httpx", "logfire", "opentelemetry", "soliplex"}
+
+
+def test_conversation_attributes_take_what_only_the_caller_knows():
+    fake = two_round_fake()
+    profile = agui.ClientProfile(
+        tools=(echo_tool(),),
+        context=({"description": "units", "value": "metric"},),
+    )
+    session = agui.Session(fake.server(), ROOM, profile)
+    turn = session.turn("go")
+
+    attrs = agui.conversation_attributes(
+        session,
+        [turn],
+        system_instructions="You are the ledger room.",
+        agent_name="x40 h2 C-ctx",
+        model="gemma4-26b",
+        server_tools=["agui_context"],
+    )
+
+    assert attrs["gen_ai.system_instructions"] == [
+        {"type": "text", "content": "You are the ledger room."}
+    ]
+    assert attrs["gen_ai.agent.name"] == "x40 h2 C-ctx"
+    assert attrs["gen_ai.request.model"] == "gemma4-26b"
+    assert attrs["gen_ai.response.model"] == "gemma4-26b"
+    assert attrs["gen_ai.tool.definitions"][-1] == {
+        "type": "function",
+        "name": "agui_context",
+    }
+    assert attrs["gen_ai.output.messages"][0]["finish_reason"] == "stop"
+    assert "finish_reason" not in attrs["pydantic_ai.all_messages"][-1]
+
+
+# -- codex round 2 -----------------------------------------------------
+
+
+def test_run_error_leaves_outcomes_unknown():
+    events = call("s1", "agui_context", "{}") + [
+        {"type": "RUN_ERROR", "message": "model went away"}
+    ]
+    fake = FakeSoliplex([[{"type": "RUN_STARTED"}, *events]])
+
+    record = agui.run_trial(fake.server(), ROOM, "go", cell="c", trial=0)
+
+    assert record.error == "model went away"
+    assert record.tool_results is None
+
+
+def test_http_refusal_keeps_outcomes_known():
+    fake = FakeSoliplex([422])
+    session = agui.Session(fake.server(), ROOM)
+
+    turn = session.turn("go")
+
+    assert turn.outcomes_complete
+
+
+def test_duplicate_ids_keep_every_observed_call():
+    events = (
+        call("c1", "agui_context", "{}")
+        + result("c1", "ctx")
+        + call("c1", "run_monty", '{"code": "x"}', parent="a2")
+    )
+    fake = FakeSoliplex([framed(events)])
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+
+    turn = session.turn("go")
+
+    assert [c.name for c in turn.tool_calls] == ["agui_context", "run_monty"]
+    assert not turn.outcomes_complete
+
+
+def test_a_session_refuses_a_turn_after_an_error():
+    fake = FakeSoliplex([422, framed(text("a1", "x"))])
+    session = agui.Session(fake.server(), ROOM)
+    session.turn("go")
+
+    with pytest.raises(agui.SessionFailed, match="HTTP 422"):
+        session.turn("again")
+
+
+def test_tool_names_resolve_in_history_order():
+    def tool_call(call_id, name):
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": "{}"},
+        }
+
+    messages = [
+        {
+            "id": "a1",
+            "role": "assistant",
+            "toolCalls": [tool_call("x", "one")],
+        },
+        {"id": "t1", "role": "tool", "toolCallId": "x", "content": "1"},
+        {
+            "id": "a2",
+            "role": "assistant",
+            "toolCalls": [tool_call("x", "two")],
+        },
+        {"id": "t2", "role": "tool", "toolCallId": "x", "content": "2"},
+    ]
+
+    out = agui.otel_messages(messages)
+
+    assert [m["parts"][0]["name"] for m in out if m["role"] == "user"] == [
+        "one",
+        "two",
+    ]
+
+
+def test_system_instructions_follow_the_context_that_was_sent():
+    fake = FakeSoliplex([framed(text("a1", "x"))])
+    profile = agui.ClientProfile(
+        context=({"description": "units", "value": "metric"},)
+    )
+    session = agui.Session(fake.server(), ROOM, profile)
+    turn = session.turn(
+        "go", context=[{"description": "units", "value": "imperial"}]
+    )
+
+    attrs = agui.conversation_attributes(session, [turn])
+
+    assert attrs["gen_ai.system_instructions"] == [
+        {"type": "text", "content": "units: imperial"}
+    ]
+
+
+def test_each_linked_server_gets_its_own_shim(tmp_path):
+    shims = []
+
+    def spawn(argv, **kwargs):
+        shims.append(kwargs["env"]["PYTHONPATH"].split(":")[0])
+        return FakeProcess()
+
+    for _ in range(2):
+        with agui.serve(
+            tmp_path / "i.yaml",
+            log=tmp_path / "s.log",
+            port=8,
+            link_traces=True,
+            audit_runner=FakeAudit(),
+            spawn=spawn,
+            ready=lambda url: True,
+            sleep=lambda s: None,
+        ):
+            pass
+
+    assert len(set(shims)) == 2
+
+
+def test_configure_telemetry_turns_off_argument_inspection(monkeypatch):
+    import sys
+    import types
+
+    calls = []
+    fake_logfire = types.ModuleType("logfire")
+    fake_logfire.configure = lambda **kw: calls.append(kw)
+    monkeypatch.setitem(sys.modules, "logfire", fake_logfire)
+    monkeypatch.setattr(agui, "_configured", False)
+
+    agui.configure_telemetry("svc")
+
+    assert calls[0]["inspect_arguments"] is False
+
+
+# -- agy round 2 -------------------------------------------------------
+
+
+def test_parentless_call_after_a_result_starts_a_new_message():
+    events = (
+        call("s1", "agui_context", "{}", parent=None)
+        + result("s1", "ctx")
+        + call("c2", "run_monty", '{"code": "x"}', parent=None)
+    )
+    fake = FakeSoliplex([framed(events), framed(text("a3", "done"))])
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+
+    session.turn("go")
+
+    roles = [m["role"] for m in fake.bodies[1]["messages"]]
+    assert roles == ["user", "assistant", "tool", "assistant", "tool"]
+
+
+def test_no_output_messages_for_a_failed_turn():
+    loop = [
+        framed(text("a0", "partial") + call("c0", "run_monty", "{}", "a0")),
+        framed(call("c1", "run_monty", "{}", parent="a1")),
+    ]
+    fake = FakeSoliplex(loop)
+    profile = agui.ClientProfile(tools=(echo_tool(),), max_rounds=1)
+    session = agui.Session(fake.server(), ROOM, profile)
+    turn = session.turn("go")
+
+    attrs = agui.conversation_attributes(session, [turn])
+
+    assert turn.error == agui.MAX_ROUNDS
+    assert attrs["gen_ai.output.messages"] == []
+    assert "final_result" not in attrs
+    assert attrs["gen_ai.input.messages"] == attrs["pydantic_ai.all_messages"]
+
+
+def test_serve_resolves_relative_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    launched = {}
+    audit = FakeAudit()
+
+    def spawn(argv, **kwargs):
+        launched["argv"] = argv
+        launched["pythonpath"] = kwargs["env"]["PYTHONPATH"]
+        return FakeProcess()
+
+    with agui.serve(
+        pathlib.Path("cell/i.yaml"),
+        log=pathlib.Path("work/s.log"),
+        port=8,
+        link_traces=True,
+        audit_runner=audit,
+        spawn=spawn,
+        ready=lambda url: True,
+        sleep=lambda s: None,
+    ):
+        pass
+
+    assert pathlib.Path(launched["pythonpath"].split(":")[0]).is_absolute()
+    assert launched["argv"][2] == str(tmp_path / "cell" / "i.yaml")
+    assert audit.calls[0][0][-1] == str(tmp_path / "cell" / "i.yaml")
+
+
+def test_audit_detail_keeps_the_exit_code_and_report_head(tmp_path):
+    report = '{"room": {"mc_ctx": "bad"}}'
+    runner = FakeAudit((1, report, "w" * 5000))
+
+    (result,) = agui.audit(tmp_path / "i.yaml", runner=runner)
+
+    assert result.detail.startswith("exit 1: " + report)
+    assert len(result.detail) < 3000
+
+
+def test_empty_arguments_render_as_an_empty_object(monkeypatch):
+    spans = recording_spans(monkeypatch)
+    fake = FakeSoliplex(
+        [framed(call("c1", "run_monty", "")), framed(text("a2", "ok"))]
+    )
+    agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    ).turn("go")
+
+    (tool,) = [s for s in spans if s.name.startswith("execute_tool")]
+    assert tool.attributes["gen_ai.tool.call.arguments"] == {}

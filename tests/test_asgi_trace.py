@@ -92,3 +92,48 @@ def test_module_imports_nothing_from_the_server_at_import_time():
     assert "import soliplex" not in text
     assert "import opentelemetry" not in text
     assert "from opentelemetry" not in text
+
+
+def test_no_top_level_imports_beyond_the_standard_library():
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(asgi_trace.__file__).read_text())
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module.split(".")[0])
+
+    assert names <= {"__future__", "collections", "typing"}
+
+
+def test_app_wraps_soliplex_create_app_from_environment(monkeypatch):
+    import sys
+    import types
+
+    inner = object()
+    main = types.ModuleType("soliplex.main")
+    main.create_app_from_environment = lambda: inner
+    package = types.ModuleType("soliplex")
+    package.main = main
+    monkeypatch.setitem(sys.modules, "soliplex", package)
+    monkeypatch.setitem(sys.modules, "soliplex.main", main)
+    context = types.ModuleType("opentelemetry.context")
+    context.attach = lambda ctx: "token"
+    context.detach = lambda token: None
+    propagate = types.ModuleType("opentelemetry.propagate")
+    propagate.extract = lambda carrier: "ctx"
+    otel = types.ModuleType("opentelemetry")
+    otel.context = context
+    otel.propagate = propagate
+    monkeypatch.setitem(sys.modules, "opentelemetry", otel)
+    monkeypatch.setitem(sys.modules, "opentelemetry.context", context)
+    monkeypatch.setitem(sys.modules, "opentelemetry.propagate", propagate)
+
+    app = asgi_trace.app()
+
+    assert isinstance(app, asgi_trace.TraceparentMiddleware)
+    assert app.app is inner
+    assert app.extract is propagate.extract

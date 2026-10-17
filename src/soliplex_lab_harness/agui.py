@@ -32,6 +32,7 @@ import pathlib
 import re
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable
@@ -80,7 +81,13 @@ def _httpx() -> Any:
 
 @contextlib.contextmanager
 def _span(name: str, **attributes: Any) -> Iterator[Any]:
-    """A logfire span when logfire is importable, else ``None``."""
+    """A logfire span when logfire is importable, else ``None``.
+
+    ``name`` reaches ``logfire.span`` through this wrapper, where logfire's
+    ``inspect_arguments`` cannot find the call site and logs a warning per
+    span. :func:`configure_telemetry` turns that inspection off. A caller
+    that configures logfire itself passes ``inspect_arguments=False``.
+    """
     try:
         import logfire
     except ImportError:
@@ -260,6 +267,7 @@ class History:
         """
         by_id: dict[str, dict[str, Any]] = {}
         duplicates: list[str] = []
+        ordered: list[dict[str, Any]] = []
         calls: dict[str, dict[str, Any]] = {}
         results: dict[str, Any] = {}
         result_order: list[tuple[str, Any]] = []
@@ -280,6 +288,7 @@ class History:
                     self.messages.append(message)
                     by_id[message["id"]] = message
                 started[message["id"]] = message
+                orphan_parent = None
             elif kind == "TEXT_MESSAGE_CONTENT":
                 message = by_id[event["messageId"]]
                 message["content"] = (message.get("content") or "") + (
@@ -312,6 +321,7 @@ class History:
                 if event["toolCallId"] in calls:
                     duplicates.append(event["toolCallId"])
                 calls[event["toolCallId"]] = tool_call
+                ordered.append(tool_call)
             elif kind == "TOOL_CALL_ARGS":
                 function = calls[event["toolCallId"]]["function"]
                 function["arguments"] += event.get("delta", "")
@@ -325,6 +335,7 @@ class History:
                     }
                 )
                 results[event["toolCallId"]] = event.get("content", "")
+                orphan_parent = None
                 result_order.append(
                     (event["toolCallId"], event.get("content", ""))
                 )
@@ -344,11 +355,11 @@ class History:
             "duplicate_ids": duplicates,
             "tool_calls": [
                 {
-                    "id": call_id,
+                    "id": call["id"],
                     "name": call["function"]["name"],
                     "args": call["function"]["arguments"],
                 }
-                for call_id, call in calls.items()
+                for call in ordered
             ],
             "tool_results": results,
             "result_order": result_order,
@@ -487,6 +498,7 @@ class TurnResult:
     )
     tool_calls: list[ToolCall] = dataclasses.field(default_factory=list)
     tool_results: list[ToolResult] = dataclasses.field(default_factory=list)
+    outcomes_complete: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         data = {
@@ -524,6 +536,7 @@ class Session:
         self.thread_id: str | None = None
         self.messages: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
+        self.failed: str | None = None
 
     def _next_run_id(self) -> str:
         if self.thread_id is None:
@@ -554,9 +567,26 @@ class Session:
         for every run of this turn only. An HTTP refusal, a ``RUN_ERROR``
         or a run that ends waiting on non-client calls ends the turn with
         ``error`` set. A failure to create the thread or a run raises.
-        After an error the history can hold a partial run, so a further
-        turn on the same session sends that partial run back.
+        After either, the history can hold a partial run, and a further
+        turn raises :class:`SessionFailed`.
         """
+        if self.failed is not None:
+            raise SessionFailed(self.failed)
+        try:
+            result = self._turn(text, forwarded_props, context)
+        except Exception as exc:
+            self.failed = f"{type(exc).__name__}: {exc}"
+            raise
+        if result.error is not None:
+            self.failed = result.error
+        return result
+
+    def _turn(
+        self,
+        text: str,
+        forwarded_props: Any,
+        context: Sequence[Mapping[str, Any]] | None,
+    ) -> TurnResult:
         profile = self.profile
         props = (
             profile.forwarded_props
@@ -615,10 +645,12 @@ class Session:
                 self._collect(turn, seen)
                 if seen["error"]:
                     turn.error = seen["error"]
+                    turn.outcomes_complete = False
                     return turn
                 if seen["duplicate_ids"]:
                     ids = ", ".join(seen["duplicate_ids"])
                     turn.error = f"{DUPLICATE_CALL_ID}: {ids}"
+                    turn.outcomes_complete = False
                     return turn
                 pending = [
                     c
@@ -628,6 +660,7 @@ class Session:
                 if any(c["name"] in tools for c in pending):
                     if round_index == profile.max_rounds:
                         turn.error = MAX_ROUNDS
+                        turn.outcomes_complete = False
                         return turn
                     turn.rounds += 1
                     self._run_client_calls(
@@ -637,6 +670,7 @@ class Session:
                 if pending:
                     names = ", ".join(c["name"] for c in pending)
                     turn.error = f"{UNANSWERED}: {names}"
+                    turn.outcomes_complete = False
                     return turn
                 blocks = (
                     fenced_blocks(seen["run_text"], profile.fence.tag)
@@ -670,6 +704,7 @@ class Session:
             for message in self.messages
             for tool_call in message.get("toolCalls") or ()
         }
+        names.update({c["id"]: c["name"] for c in seen["tool_calls"]})
         for call_id, content in seen["result_order"]:
             turn.tool_results.append(
                 ToolResult(name=names.get(call_id), id=call_id, result=content)
@@ -691,7 +726,9 @@ class Session:
                     "gen_ai.operation.name": "execute_tool",
                     "gen_ai.tool.name": call["name"],
                     "gen_ai.tool.call.id": call["id"],
-                    "gen_ai.tool.call.arguments": _as_json(call["args"]),
+                    "gen_ai.tool.call.arguments": _as_json(
+                        call["args"] or "{}"
+                    ),
                     "gen_ai.conversation.id": self.thread_id,
                 },
             ) as span:
@@ -802,13 +839,11 @@ def otel_messages(
     parts per message, and each run of tool messages folded into one
     ``user`` message of ``tool_call_response`` parts.
     """
-    names = {
-        tool_call["id"]: tool_call["function"]["name"]
-        for message in messages
-        for tool_call in message.get("toolCalls") or ()
-    }
+    names: dict[str, str] = {}  # the latest call with each id so far
     out: list[dict[str, Any]] = []
     for message in messages:
+        for tool_call in message.get("toolCalls") or ():
+            names[tool_call["id"]] = tool_call["function"]["name"]
         if message["role"] == "tool":
             part = {
                 "type": "tool_call_response",
@@ -843,19 +878,32 @@ def otel_messages(
 
 
 def conversation_attributes(
-    session: Session, turns: Sequence[TurnResult]
+    session: Session,
+    turns: Sequence[TurnResult],
+    *,
+    system_instructions: str | None = None,
+    agent_name: str | None = None,
+    model: str | None = None,
+    server_tools: Sequence[str] = (),
 ) -> dict[str, Any]:
     """The trial as pydantic-ai's ``invoke_agent`` span attributes.
 
     Set on a trial span, these make Logfire show every round, tool call,
-    result and the final answer as one chat history. The client's context
-    entries stand in for ``gen_ai.system_instructions``. Values are lists
-    and dicts, so logfire writes ``logfire.json_schema`` itself.
+    result and the final answer as one chat history. Values are lists and
+    dicts, so logfire writes ``logfire.json_schema`` itself.
+
+    The client cannot see the room's system prompt, so
+    ``system_instructions`` defaults to the context entries sent in the
+    latest run.
+    ``server_tools`` names tools that ran on the server, which join the
+    client tools in ``gen_ai.tool.definitions``.
     """
     messages = otel_messages(session.messages)
+    finished = bool(turns) and turns[-1].error is None
+    finished = finished and session.failed is None
     final = (
-        messages[-1:]
-        if messages and messages[-1]["role"] == "assistant"
+        [messages[-1] | {"finish_reason": "stop"}]
+        if finished and messages and messages[-1]["role"] == "assistant"
         else []
     )
     attrs: dict[str, Any] = {
@@ -866,28 +914,37 @@ def conversation_attributes(
         "gen_ai.input.messages": messages[: len(messages) - len(final)],
         "gen_ai.output.messages": final,
     }
+    if agent_name is not None:
+        attrs["gen_ai.agent.name"] = agent_name
+    if model is not None:
+        attrs["gen_ai.request.model"] = model
+        attrs["gen_ai.response.model"] = model
     profile = session.profile
-    if profile.tools:
-        attrs["gen_ai.tool.definitions"] = [
-            {
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": dict(tool.parameters),
-            }
-            for tool in profile.tools
-        ]
-    if profile.context:
+    definitions = [
+        {
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": dict(tool.parameters),
+        }
+        for tool in profile.tools
+    ] + [{"type": "function", "name": name} for name in server_tools]
+    if definitions:
+        attrs["gen_ai.tool.definitions"] = definitions
+    context = (
+        session.runs[-1]["request"]["context"]
+        if session.runs
+        else profile.context
+    )
+    if system_instructions is None and context:
+        system_instructions = "\n".join(
+            f"{c.get('description')}: {c.get('value')}" for c in context
+        )
+    if system_instructions is not None:
         attrs["gen_ai.system_instructions"] = [
-            {
-                "type": "text",
-                "content": "\n".join(
-                    f"{c.get('description')}: {c.get('value')}"
-                    for c in profile.context
-                ),
-            }
+            {"type": "text", "content": system_instructions}
         ]
-    final_text = turns[-1].final_text if turns else None
+    final_text = turns[-1].final_text if finished else None
     if final_text is not None:
         attrs["final_result"] = final_text
     return attrs
@@ -933,7 +990,11 @@ def to_record(
     calls = [c for t in turns for c in t.tool_calls]
     results = [r for t in turns for r in t.tool_results]
     answered = {r.id for r in results}
-    unknown = failure is not None or any(c.id not in answered for c in calls)
+    unknown = (
+        failure is not None
+        or any(not t.outcomes_complete for t in turns)
+        or any(c.id not in answered for c in calls)
+    )
     return records.TrialRecord(
         cell=cell,
         trial=trial,
@@ -948,6 +1009,14 @@ def to_record(
 
 
 # -- servers -----------------------------------------------------------
+
+
+class SessionFailed(RuntimeError):
+    """A turn after an earlier turn on the session ended in an error."""
+
+    def __init__(self, error: str):
+        self.error = error
+        super().__init__(f"session unusable after an earlier error: {error}")
 
 
 class ServeError(RuntimeError):
@@ -1035,9 +1104,14 @@ def _launcher(command: Sequence[str] | None, environment: Any) -> list[str]:
     return list(command or ["soliplex-cli"])
 
 
-def _tail(text: str, limit: int = 2000) -> str:
-    text = text.strip()
-    return text if len(text) <= limit else "..." + text[-limit:]
+def _audit_detail(code: int, out: str, err: str) -> str:
+    """The exit code, the head of the JSON report, the tail of stderr."""
+    out, err = out.strip(), err.strip()
+    if len(out) > 1500:
+        out = out[:1500] + "..."
+    if len(err) > 1000:
+        err = "..." + err[-1000:]
+    return f"exit {code}: {out}\n{err}".strip()
 
 
 def audit(
@@ -1057,6 +1131,7 @@ def audit(
     result's detail holds the JSON error report and stderr.
     """
     argv = _launcher(command, environment)
+    installation = installation.resolve()
     full_env = dict(os.environ, **(env or {}))
     name = cell if cell is not None else str(installation)
     results = []
@@ -1064,7 +1139,7 @@ def audit(
         code, out, err = runner(
             [*argv, "audit", "-q", section, str(installation)], full_env
         )
-        detail = "" if code == 0 else _tail(f"exit {code}: {out}\n{err}")
+        detail = "" if code == 0 else _audit_detail(code, out, err)
         results.append(
             preconditions.Result(
                 name, f"soliplex-cli audit {section}", code == 0, detail
@@ -1112,6 +1187,8 @@ def serve(
     :func:`configure_telemetry` has run in this process.
     """
     prefix = _launcher(command, environment)
+    installation = installation.resolve()
+    log = log.resolve()
     checks = audit(
         installation,
         command=prefix,
@@ -1133,8 +1210,9 @@ def serve(
     log.parent.mkdir(parents=True, exist_ok=True)
     server_env = dict(os.environ, **(env or {}))
     if _configured if link_traces is None else link_traces:
-        shim = log.parent / "lab_harness_asgi"
-        shim.mkdir(exist_ok=True)
+        shim = pathlib.Path(
+            tempfile.mkdtemp(prefix="lab_harness_asgi-", dir=log.parent)
+        )
         source = pathlib.Path(__file__).with_name("asgi_trace.py")
         (shim / f"{ASGI_TRACE_MODULE}.py").write_text(source.read_text())
         paths = [str(shim), server_env.get("PYTHONPATH", "")]
@@ -1206,6 +1284,7 @@ def configure_telemetry(
         console=False,
         scrubbing=scrubbing,
         distributed_tracing=True,
+        inspect_arguments=False,  # see _span
     )
     _configured = True
 
