@@ -448,19 +448,6 @@ testable without a network or a real `uv`. The default runner raises
   asset means an installed arm measures different software than a checkout
   would. soliplex ships `SKILL.md` via `MANIFEST.in`'s `global-include`.
 
-## Trace review
-
-`soliplex_lab_harness.review` extracts bounded evidence packets from failed
-trial records and Logfire traces. It classifies one packet at a time, groups
-repeated non-model causes, creates gated lesson proposals, and lists trials
-that need a frontier reviewer. Proposals never change questions, checks,
-documentation, scorers, or harness code.
-
-A model failing a question is never by itself evidence that the question or
-check is wrong. Change a question or a check only for a demonstrated flaw.
-Question changes go through the question panel. Scorer and harness changes
-need a failing (red) test first. Proposals are never applied automatically.
-
 ## Development
 
 ```bash
