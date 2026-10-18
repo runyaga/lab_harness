@@ -378,17 +378,24 @@ class History:
 
 # -- fenced blocks -----------------------------------------------------
 
-_FENCE = re.compile(r"^```[ \t]*([\w+-]*)[ \t]*\n(.*?)^```", re.M | re.S)
+#: An opening fence with its info string, the body, and a closing fence
+#: that holds only the backticks and trailing whitespace.
+_FENCE = re.compile(r"^```[ \t]*([^`\n]*)\n(.*?)^```[ \t\r]*$", re.M | re.S)
+
+
+def _fences(text: str) -> list[tuple[str, str]]:
+    """``(tag, body)`` per block. The tag is the whole info string."""
+    return [(info.strip(), body) for info, body in _FENCE.findall(text)]
 
 
 def fenced_blocks(text: str, tag: str) -> list[str]:
     """The bodies of the ```` ```tag ```` blocks in ``text``, in order."""
-    return [body for found, body in _FENCE.findall(text) if found == tag]
+    return [body for found, body in _fences(text) if found == tag]
 
 
 def fence_tags(text: str) -> list[str]:
     """The tag of every fenced block in ``text``, ``""`` when untagged."""
-    return [found for found, _ in _FENCE.findall(text)]
+    return [found for found, _ in _fences(text)]
 
 
 def _default_reply(tag: str) -> Callable[[list[str]], str]:
@@ -537,6 +544,9 @@ class Session:
         self.messages: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
         self.failed: str | None = None
+        #: The turn in progress when the latest :meth:`turn` raised.
+        self.partial: TurnResult | None = None
+        self._current: TurnResult | None = None
 
     def _next_run_id(self) -> str:
         if self.thread_id is None:
@@ -568,14 +578,20 @@ class Session:
         or a run that ends waiting on non-client calls ends the turn with
         ``error`` set. A failure to create the thread or a run raises.
         After either, the history can hold a partial run, and a further
-        turn raises :class:`SessionFailed`.
+        turn raises :class:`SessionFailed`. A raised turn's rounds so far
+        are :attr:`partial`, with the exception as its error.
         """
+        self.partial = self._current = None
         if self.failed is not None:
             raise SessionFailed(self.failed)
         try:
             result = self._turn(text, forwarded_props, context)
         except Exception as exc:
             self.failed = f"{type(exc).__name__}: {exc}"
+            if self._current is not None:
+                self._current.error = self.failed
+                self._current.outcomes_complete = False
+                self.partial = self._current
             raise
         if result.error is not None:
             self.failed = result.error
@@ -599,7 +615,7 @@ class Session:
         start = len(self.messages)
         self.messages.append(user_message(text))
         history = History(self.messages)
-        turn = TurnResult(user=text, state=self.state)
+        turn = self._current = TurnResult(user=text, state=self.state)
         for round_index in range(profile.max_rounds + 1):
             with _span(
                 "client round {round}", round=round_index, room=self.room
@@ -657,7 +673,13 @@ class Session:
                     for c in seen["tool_calls"]
                     if c["id"] not in seen["tool_results"]
                 ]
-                if any(c["name"] in tools for c in pending):
+                waiting = [c for c in pending if c["name"] not in tools]
+                if waiting:
+                    names = ", ".join(c["name"] for c in waiting)
+                    turn.error = f"{UNANSWERED}: {names}"
+                    turn.outcomes_complete = False
+                    return turn
+                if pending:
                     if round_index == profile.max_rounds:
                         turn.error = MAX_ROUNDS
                         turn.outcomes_complete = False
@@ -667,11 +689,6 @@ class Session:
                         turn, history, tools, pending, round_index + 1
                     )
                     continue
-                if pending:
-                    names = ", ".join(c["name"] for c in pending)
-                    turn.error = f"{UNANSWERED}: {names}"
-                    turn.outcomes_complete = False
-                    return turn
                 blocks = (
                     fenced_blocks(seen["run_text"], profile.fence.tag)
                     if profile.fence is not None
@@ -814,6 +831,8 @@ def run_trial(
                     break
         except Exception as exc:  # noqa: BLE001 -- recorded, not handled
             failure = f"{type(exc).__name__}: {exc}"
+            if session.partial is not None:
+                turns.append(session.partial)
         if span is not None:
             span.set_attribute("thread_id", session.thread_id)
             for key, value in conversation_attributes(session, turns).items():

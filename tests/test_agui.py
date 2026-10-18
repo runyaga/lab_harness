@@ -88,6 +88,8 @@ class FakeSoliplex:
         if request.method == "POST" and path.startswith(f"{base}/{THREAD}/"):
             self.bodies.append(json.loads(request.content))
             script = self.scripts.pop(0)
+            if isinstance(script, Exception):
+                raise script
             if isinstance(script, int):
                 return httpx.Response(script, text="refused")
             lines = "".join(f"data: {json.dumps(e)}\n\n" for e in script)
@@ -352,7 +354,8 @@ def test_unparseable_arguments_go_back_to_the_model():
     assert sent["error"]["type"] == "JSONDecodeError"
 
 
-def test_unknown_call_beside_a_client_call_gets_an_error_result():
+def test_unanswered_server_call_beside_a_client_call_ends_the_turn():
+    ran = []
     fake = FakeSoliplex(
         [
             framed(
@@ -362,16 +365,18 @@ def test_unknown_call_beside_a_client_call_gets_an_error_result():
             framed(text("a2", "ok")),
         ]
     )
+    tool = echo_tool(handler=lambda args: ran.append(args) or "{}")
     session = agui.Session(
-        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+        fake.server(), ROOM, agui.ClientProfile(tools=(tool,))
     )
 
     turn = session.turn("go")
 
-    assert [c["name"] for c in turn.client_calls] == ["run_monty", "invented"]
-    assert json.loads(turn.client_calls[1]["result"]) == {
-        "error": "unknown tool invented"
-    }
+    assert turn.error == f"{agui.UNANSWERED}: invented"
+    assert ran == []
+    assert turn.client_calls == []
+    assert not turn.outcomes_complete
+    assert len(fake.bodies) == 1
 
 
 # -- error paths -------------------------------------------------------
@@ -497,6 +502,39 @@ def test_fence_tags():
     reply = "```monty\nx\n```\n```python\ny\n```\n```\nz\n```"
 
     assert agui.fence_tags(reply) == ["monty", "python", ""]
+
+
+def test_fence_after_an_info_string_with_punctuation_is_found():
+    reply = "```c#\na\n```\n```python\nx = 1\n```"
+
+    assert agui.fenced_blocks(reply, "python") == ["x = 1\n"]
+    assert agui.fence_tags(reply) == ["c#", "python"]
+
+
+def test_fence_tag_is_the_whole_info_string():
+    reply = '```python title="a.py"\nx\n```\n```objective-c++\ny\n```'
+
+    assert agui.fence_tags(reply) == ['python title="a.py"', "objective-c++"]
+    assert agui.fenced_blocks(reply, "python") == []
+
+
+def test_a_result_block_the_model_wrote_is_not_a_program():
+    reply = "```monty\nprint(1)\n```\n\n```monty result:\n1\n```"
+
+    assert agui.fenced_blocks(reply, "monty") == ["print(1)\n"]
+    assert agui.fence_tags(reply) == ["monty", "monty result:"]
+
+
+def test_fence_with_crlf_line_ends():
+    reply = "```monty\r\nx = 1\r\n```\r\n"
+
+    assert agui.fenced_blocks(reply, "monty") == ["x = 1\r\n"]
+
+
+def test_fence_line_with_an_info_string_does_not_close_a_block():
+    reply = "```monty\na = 1\n```monty\nb = 2\n```"
+
+    assert agui.fenced_blocks(reply, "monty") == ["a = 1\n```monty\nb = 2\n"]
 
 
 def test_fence_round_sends_result_as_next_user_message():
@@ -749,6 +787,72 @@ def test_run_trial_records_an_exception():
 
     assert not record.ok
     assert record.error.startswith("HTTPStatusError")
+    assert record.tool_results is None
+
+
+def raising_after_a_client_round():
+    return FakeSoliplex(
+        [
+            framed(call("c1", "run_monty", '{"code": "x"}')),
+            httpx.ConnectError("refused"),
+        ]
+    )
+
+
+def test_a_raising_round_keeps_the_partial_turn():
+    fake = raising_after_a_client_round()
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+
+    with pytest.raises(httpx.ConnectError):
+        session.turn("go")
+
+    partial = session.partial
+    assert [c["name"] for c in partial.client_calls] == ["run_monty"]
+    assert partial.rounds == 1
+    assert partial.error.startswith("ConnectError")
+    assert not partial.outcomes_complete
+
+
+def test_partial_is_none_after_a_turn_that_returns():
+    fake = FakeSoliplex([framed(text("a1", "hi"))])
+    session = agui.Session(fake.server(), ROOM)
+
+    session.turn("go")
+
+    assert session.partial is None
+
+
+def test_a_refused_turn_after_a_raised_turn_has_no_partial():
+    fake = raising_after_a_client_round()
+    session = agui.Session(
+        fake.server(), ROOM, agui.ClientProfile(tools=(echo_tool(),))
+    )
+    with pytest.raises(httpx.ConnectError):
+        session.turn("go")
+
+    with pytest.raises(agui.SessionFailed):
+        session.turn("again")
+
+    assert session.partial is None
+
+
+def test_run_trial_records_the_rounds_of_a_raising_turn():
+    fake = raising_after_a_client_round()
+
+    record = agui.run_trial(
+        fake.server(),
+        ROOM,
+        "go",
+        cell="c",
+        trial=0,
+        profile=agui.ClientProfile(tools=(echo_tool(),)),
+    )
+
+    assert record.error.startswith("ConnectError")
+    assert record.metadata["rounds"] == 1
+    assert [c.name for c in record.tool_calls] == ["run_monty"]
     assert record.tool_results is None
 
 
